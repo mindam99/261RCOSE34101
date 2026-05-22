@@ -15,6 +15,12 @@
  * 프로세스 '7개'를 생성한 뒤 arrival time 순서로 정렬해서 출력
  */
 
+/*
+* Config
+* ------------------------------------------------------------
+* ready queue, waiting queue를 초기화하기 위함 함수
+*/
+
 /* 생성할 프로세스 개수: 과제 시뮬레이션 결과 확인이 용이하도록 7개로 고정했다. */
 #define PROCESS_COUNT 7
 
@@ -27,10 +33,8 @@
  *
  * cpu_burst_count가 1:
  *   CPU
- *
  * cpu_burst_count가 2:
  *   CPU -> I/O -> CPU
- *
  * cpu_burst_count가 3:
  *   CPU -> I/O -> CPU -> I/O -> CPU
  */
@@ -55,6 +59,9 @@
 /* 실제 OS의 PID처럼 1000부터 9999 사이에서 PID를 랜덤 생성 */
 #define MIN_PID 1000
 #define MAX_PID 9999
+
+/* round robin 구현 시 사용할 기본 time quantum */
+#define DEFAULT_TIME_QUANTUM 2
 
 /*
  * Process 구조체
@@ -99,6 +106,39 @@ typedef struct {
      */
     int io_bursts[MAX_CPU_BURST_COUNT - 1];
 } Process;
+
+/*
+ * Queue 구조체
+ * ------------------------------------------------------------
+ * ready queue와 waiting queue를 표현하기 위한 circular queue를 정의
+ * queue에는 Process 자체를 복사하지 않고 process의 index만 저장
+ * 예: data로 3이 들어가 있는 경우 이는 곧 P3을 의미
+ */
+typedef struct {
+    int data[PROCESS_COUNT];
+    int front;
+    int rear;
+    int count;
+} Queue;
+
+/*
+ * SchedulerConfig 구조체
+ * ------------------------------------------------------------
+ * scheduling 시작 전 필요한 시스템 환경 정보 정의
+ *
+ * ready_queue      : CPU를 할당받을 수 있는(대기 중인) process들의 queue
+ * waiting_queue    : I/O 때문에 기다리는 process들의 queue
+ * current_time     : simulator의 현재 시간
+ * next_arrival_index : 아직 ready queue에 들어가지 않은 다음 process의 index
+ * time_quantum     : Round Robin에서 사용할 time quantum
+ */
+typedef struct {
+    Queue ready_queue;
+    Queue waiting_queue;
+    int current_time;           // simulator의 작동 시점을 기준으로 하는 시계 역할 - scheduling의 시간 경과 확인
+    int next_arrival_index;     // 매번 전체 index의 arrival을 검사하는 것을 피하기 위한 마킹 역할
+    int time_quantum;
+} SchedulerConfig;
 
 /*
  * random_between()
@@ -158,7 +198,7 @@ static int create_unique_pid(const Process processes[], int count) {
  *
  * return 값에 따라,
  *  음수: a가 b보다 앞에 와야 함
- *  0   : 순서가 같음
+ *  0   : a와 b의 순서가 같아도 무방
  *  양수: b가 a보다 앞에 와야 함
  */
 static int compare_by_arrival_time(const void *left, const void *right) {
@@ -247,6 +287,173 @@ static void create_processes(Process processes[]) {
 }
 
 /*
+ * init_queue()
+ * ------------------------------------------------------------
+ * queue를 비어 있는 상태로 초기화
+ *
+ * front: 다음에 dequeue할 위치
+ * rear : 마지막으로 enqueue된 위치
+ * count: 현재 queue에 들어 있는 process 개수
+ */
+static void init_queue(Queue* queue) {
+    queue->front = 0;
+    queue->rear = -1;
+    queue->count = 0;
+}
+
+/*
+ * is_queue_empty()
+ * ------------------------------------------------------------
+ * queue가 비어 있는지 확인
+ */
+static int is_queue_empty(const Queue* queue) {
+    return queue->count == 0;
+}
+
+/*
+ * is_queue_full()
+ * ------------------------------------------------------------
+ * queue가 가득 찼는지 확인
+ * process 개수가 7개이므로 queue에는 최대 7개의 index만 저장 가능
+ */
+static int is_queue_full(const Queue* queue) {
+    return queue->count == PROCESS_COUNT;
+}
+
+/*
+ * enqueue()
+ * ------------------------------------------------------------
+ * queue의 뒤쪽에 process index를 enqueue
+ *
+ * return 1: 삽입 성공
+ * return 0: 삽입 실패 - queue가 full
+ */
+static int enqueue(Queue* queue, int process_index) {
+    if (is_queue_full(queue)) {
+        return 0;
+    }
+
+    queue->rear = (queue->rear + 1) % PROCESS_COUNT;
+    queue->data[queue->rear] = process_index;
+    queue->count++;
+
+    return 1;
+}
+
+/*
+ * dequeue()
+ * ------------------------------------------------------------
+ * queue의 앞쪽 process index를 dequeue
+ *
+ * ready queue에서는 CPU를 할당받을 process를 꺼낼 때
+ * waiting queue에서는 I/O가 끝난 process를 꺼내 ready queue로 보낼 때
+ *
+ * return nonnegative integer: queue에서 꺼낸 process의 index
+ * return -1: queue가 empty
+ */
+static int dequeue(Queue* queue) {
+    int process_index;
+
+    if (is_queue_empty(queue)) {
+        return -1;
+    }
+
+    process_index = queue->data[queue->front];
+    queue->front = (queue->front + 1) % PROCESS_COUNT;
+    queue->count--;
+
+    /* queue가 비면 front/rear를 초기 상태로 되돌림 */
+    if (queue->count == 0) {
+        queue->front = 0;
+        queue->rear = -1;
+    }
+
+    return process_index;
+}
+
+/*
+ * config()
+ * ------------------------------------------------------------
+ * scheduling 시작 전 시스템 환경 초기화
+ *
+ * workflow:
+ *  1. ready queue 초기화
+ *  2. waiting queue 초기화
+ *  3. simulator의 현재 시간을 0으로 초기화
+ *  4. round robin용 time quantum 값 설정
+ *  5. arrival_time이 현재 시간 이하인 process를 ready queue에 삽입
+ *
+ * waiting queue는 CPU burst 후 I/O 발생시 사용되므로 초기에는 empty
+ */
+static void config(SchedulerConfig* scheduler_config, const Process processes[]) {
+    init_queue(&scheduler_config->ready_queue);
+    init_queue(&scheduler_config->waiting_queue);
+
+    scheduler_config->current_time = 0;
+    scheduler_config->next_arrival_index = 0;
+    scheduler_config->time_quantum = DEFAULT_TIME_QUANTUM;
+
+    /* arrival_time이 0인 process는 scheduling 시작 시점부터 바로 ready queue에 들어갈 수 있음 */
+    while (scheduler_config->next_arrival_index < PROCESS_COUNT &&
+        processes[scheduler_config->next_arrival_index].arrival_time <= scheduler_config->current_time) {
+        enqueue(&scheduler_config->ready_queue, scheduler_config->next_arrival_index);
+        scheduler_config->next_arrival_index++;
+    }
+}
+
+/*
+ * print_queue()
+ * ------------------------------------------------------------
+ * queue 내부 process index를 출력
+ *
+ * 출력용 '복사본'을 만들어 dequeue하므로 실제 queue 내용에는 변동 없음
+ */
+static void print_queue(const char* queue_name, const Queue* queue) {
+    Queue temp = *queue;
+    int process_index;
+
+    printf("%s: ", queue_name);
+
+    if (is_queue_empty(queue)) {
+        printf("(empty)\n");
+        return;
+    }
+
+    while (!is_queue_empty(&temp)) {
+        process_index = dequeue(&temp);
+        printf("P%d", process_index);
+
+        if (!is_queue_empty(&temp)) {
+            printf(" -> ");
+        }
+    }
+
+    printf("\n");
+}
+
+/*
+ * print_config()
+ * ------------------------------------------------------------
+ * Config() 수행 후의 시스템 환경 출력
+ * ready queue 및 waiting queue가 제대로 초기화되었는지 확인
+ */
+static void print_config(const SchedulerConfig* scheduler_config) {
+    printf("\n=== System Config ===\n");
+    printf("Current Time       : %d\n", scheduler_config->current_time);
+    printf("Time Quantum       : %d\n", scheduler_config->time_quantum);
+
+    if (scheduler_config->next_arrival_index < PROCESS_COUNT) {
+        printf("Next Arrival Index : P%d\n", scheduler_config->next_arrival_index);
+    }
+    else {
+        printf("Next Arrival Index : none\n");
+    }
+
+    print_queue("Ready Queue        ", &scheduler_config->ready_queue);
+    print_queue("Waiting Queue      ", &scheduler_config->waiting_queue);
+}
+
+/*
  * print_processes()
  * ------------------------------------------------------------
  * 생성된 process 정보를 표 형태로 출력 (중간 점검용)
@@ -285,6 +492,9 @@ int main(void) {
     /* process 7개를 저장하는 배열의 정의 */
     Process processes[PROCESS_COUNT];
 
+    /* scheduling 환경 설정 정보를 저장 */
+    SchedulerConfig scheduler_config;
+
     /*
      * 난수 생성기의 seed
      * 현재는 결과 확인과 디버깅을 용이하게 하기 위해 고정 seed 2026으로 설정
@@ -295,6 +505,10 @@ int main(void) {
     create_processes(processes);
 
     print_processes(processes);
+
+    config(&scheduler_config, processes);
+
+    print_config(&scheduler_config);
 
     return 0;
 }
