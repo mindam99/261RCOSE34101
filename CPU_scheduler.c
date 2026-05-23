@@ -488,12 +488,197 @@ static void print_processes(const Process processes[]) {
     }
 }
 
+/*
+ * clear_input_buffer()
+ * ------------------------------------------------------------
+ * 잘못된 input이 들어왔을 때 input buffer를 비운다. (예외 처리용 함수)
+ */
+static void clear_input_buffer(void) {
+    int ch;
+    while ((ch = getchar()) != '\n' && ch != EOF) {
+        ;
+    }
+}
+
+/*
+ * print_algorithm_menu()
+ * ------------------------------------------------------------
+ * 실행할 scheduling algorithm을 선택할 menu 출력
+ */
+static void print_algorithm_menu(void) {
+    printf("\n=== Scheduling Algorithm Menu ===\n");
+    printf("1. FCFS\n");
+    printf("2. Non-Preemptive SJF\n");
+    printf("3. Preemptive SJF\n");
+    printf("4. Non-Preemptive Priority\n");
+    printf("5. Preemptive Priority\n");
+    printf("6. Round Robin\n");
+    printf("0. Exit\n");
+}
+
+/*
+ * select_algorithm()
+ * ------------------------------------------------------------
+ * menu에서 사용자의 입력을 받아 scheduling algorithm 번호를 반환
+ *
+ * return 0: simulator 종료
+ * return 1~6: 각 scheduling algorithm과 대응
+ */
+static int select_algorithm(void) {
+    int choice;
+
+    while (1) {
+        print_algorithm_menu();
+        printf("Select an algorithm: ");
+
+        if (scanf("%d", &choice) != 1) {
+            printf("Invalid input. Please enter a number.\n");
+            clear_input_buffer();
+            continue;
+        }
+
+        if (choice >= 0 && choice <= 6) {
+            return choice;
+        }
+
+        printf("Invalid selection. Please choose agin.\n");
+    }
+}
+
+/*
+ * print_algorithm_placeholder()
+ * ------------------------------------------------------------
+ * 현재 단계에서는 algorithm 선택 기능만 먼저 구현
+ * 실제 scheduling logic, Gantt Chart, Evaluation은 다음 단계에서 각각 구현 예정
+ */
+static void print_algorithm_placeholder(const char* algorithm_name, const SchedulerConfig* scheduler_config) {
+    printf("\n=== %s Scheduling Result ===\n", algorithm_name);
+    printf("Algorithm selected successfully.\n");
+
+    /* 선택된 algorithm이 동일한 초기 환경에서 계산되는지 확인용 */
+    print_config(scheduler_config);
+}
+
+/*
+ * run_fcfs()
+ * ------------------------------------------------------------
+ * FCFS scheduling을 실행할 함수
+ * 현재는 menu 연결 확인용 skeleton만 작성
+ */
+static void run_fcfs(const Process processes[], const SchedulerConfig* base_config) {
+    SchedulerConfig run_config = *base_config;
+
+    (void)processes;
+    print_algorithm_placeholder("FCFS", &run_config);
+}
+
+/*
+ * run_non_preemptive_sjf()
+ * ------------------------------------------------------------
+ * Non-Preemptive SJF scheduling을 실행할 함수
+ * 현재는 menu 연결 확인용 skeleton만 작성
+ */
+static void run_non_preemptive_sjf(const Process processes[], const SchedulerConfig* base_config) {
+    SchedulerConfig run_config = *base_config;
+
+    (void)processes;
+    print_algorithm_placeholder("Non-Preemptive SJF", &run_config);
+}
+
+/*
+ * run_preemptive_sjf()
+ * ------------------------------------------------------------
+ * Preemptive SJF scheduling을 실행할 함수
+ * 현재는 menu 연결 확인용 skeleton만 작성
+ */
+static void run_preemptive_sjf(const Process processes[], const SchedulerConfig* base_config) {
+    SchedulerConfig run_config = *base_config;
+
+    (void)processes;
+    print_algorithm_placeholder("Preemptive SJF", &run_config);
+}
+
+/*
+ * run_non_preemptive_priority()
+ * ------------------------------------------------------------
+ * Non-Preemptive Priority scheduling을 실행할 함수
+ * 현재는 menu 연결 확인용 skeleton만 작성
+ */
+static void run_non_preemptive_priority(const Process processes[], const SchedulerConfig* base_config) {
+    SchedulerConfig run_config = *base_config;
+
+    (void)processes;
+    print_algorithm_placeholder("Non-Preemptive Priority", &run_config);
+}
+
+/*
+ * run_preemptive_priority()
+ * ------------------------------------------------------------
+ * Preemptive Priority scheduling을 실행할 함수
+ * 현재는 menu 연결 확인용 skeleton만 작성
+ */
+static void run_preemptive_priority(const Process processes[], const SchedulerConfig* base_config) {
+    SchedulerConfig run_config = *base_config;
+
+    (void)processes;
+    print_algorithm_placeholder("Preemptive Priority", &run_config);
+}
+
+/*
+ * run_round_robin()
+ * ------------------------------------------------------------
+ * Round Robin scheduling을 실행할 함수
+ * 현재는 menu 연결 확인용 skeleton만 작성
+ */
+static void run_round_robin(const Process processes[], const SchedulerConfig* base_config) {
+    SchedulerConfig run_config = *base_config;
+
+    (void)processes;
+    print_algorithm_placeholder("Round Robin", &run_config);
+}
+
+/*
+ * schedule()
+ * ------------------------------------------------------------
+ * 사용자가 menu에서 입력한 번호에 맞는 scheduling 함수를 호출
+ *
+ * 실제 algorithm 구현은 run_fcfs(), run_round_robin() 등의 내부에 추가 예정
+ */
+static void schedule(int selected_algorithm, const Process processes[], const SchedulerConfig* base_config) {
+    switch (selected_algorithm) {
+    case 1:
+        run_fcfs(processes, base_config);
+        break;
+    case 2:
+        run_non_preemptive_sjf(processes, base_config);
+        break;
+    case 3:
+        run_preemptive_sjf(processes, base_config);
+        break;
+    case 4:
+        run_non_preemptive_priority(processes, base_config);
+        break;
+    case 5:
+        run_preemptive_priority(processes, base_config);
+        break;
+    case 6:
+        run_round_robin(processes, base_config);
+        break;
+    default:
+        printf("Invalid algorithm selected.\n");
+        break;
+    }
+}
+
 int main(void) {
     /* process 7개를 저장하는 배열의 정의 */
     Process processes[PROCESS_COUNT];
 
-    /* scheduling 환경 설정 정보를 저장 */
+    /* config()에서 초기화할 scheduler 환경 정보 */
     SchedulerConfig scheduler_config;
+
+    /* 사용자가 menu에서 선택한 scheduling algorithm 번호 */
+    int selected_algorithm;
 
     /*
      * 난수 생성기의 seed
@@ -509,6 +694,21 @@ int main(void) {
     config(&scheduler_config, processes);
 
     print_config(&scheduler_config);
+
+    /*
+     * 사용자가 종료를 선택할 때까지 algorithm 선택 menu를 반복 출력
+     * 선택된 algorithm에 따라 schedule()에서 해당 run 함수로 분기
+     */
+    while (1) {
+        selected_algorithm = select_algorithm();
+
+        if (selected_algorithm == 0) {
+            printf("Exit scheduler simulator.\n");
+            break;
+        }
+
+        schedule(selected_algorithm, processes, &scheduler_config);
+    }
 
     return 0;
 }
