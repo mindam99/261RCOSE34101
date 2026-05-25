@@ -63,6 +63,24 @@
 /* round robin 구현 시 사용할 기본 time quantum */
 #define DEFAULT_TIME_QUANTUM 2
 
+/* Gantt chart에 저장할 구간 수 */
+#define MAX_GANTT_SEGMENTS 200
+
+/* Gantt chart에서 CPU가 idle한 구간을 표시하기 위한 값 */
+#define IDLE_PROCESS -1
+
+/* 다음 event time을 찾을 때 사용할 충분히 큰 값
+* process의 arrival이나 I/O completion 같이 scheduler의 상태 관리에 큰 영향을 주는 요인들을 발생시키는 시점 탐색용
+*/
+#define INF 1000000000
+
+#define ALG_FCFS 1
+#define ALG_NON_PREEMPTIVE_SJF 2
+#define ALG_PREEMPTIVE_SJF 3
+#define ALG_NON_PREEMPTIVE_PRIORITY 4
+#define ALG_PREEMPTIVE_PRIORITY 5
+#define ALG_ROUND_ROBIN 6
+
 /*
  * Process 구조체
  * ------------------------------------------------------------
@@ -139,6 +157,21 @@ typedef struct {
     int next_arrival_index;     // 매번 전체 index의 arrival을 검사하는 것을 피하기 위한 마킹 역할
     int time_quantum;
 } SchedulerConfig;
+
+/* GanttSegment 구조체
+ * ------------------------------------------------------------
+ * Gantt chart의 한 단위의 구간을 저장
+ *
+ * process_index : 해당 구간에서 실행된 process index
+ *                 IDLE_PROCESS이면 idle 구간
+ * start_time    : 구간 시작 시간
+ * end_time      : 구간 종료 시간
+ */
+typedef struct {
+    int process_index;
+    int start_time;
+    int end_time;
+} GanttSegment;
 
 /*
  * random_between()
@@ -371,6 +404,34 @@ static int dequeue(Queue* queue) {
     return process_index;
 }
 
+/* remove_from_queue()
+ * ------------------------------------------------------------
+ * queue에서 I/O가 끝난 process를 waiting queue에서 제거할 때 사용
+ * dequeue는 queue의 임의의 위치에 있는 item을 바로 제거할 수 없기 때문에 추가한 함수
+ * 나머지 process들의 순서는 동일하게 유지시킨다.
+ */
+static int remove_from_queue(Queue* queue, int process_index) {
+    Queue temp;
+    int removed = 0;
+    int current;
+
+    init_queue(&temp);
+
+    while (!is_queue_empty(queue)) {
+        current = dequeue(queue);
+
+        if (current == process_index && !removed) {
+            removed = 1;
+        }
+        else {
+            enqueue(&temp, current);
+        }
+    }
+
+    *queue = temp;
+    return removed;
+}
+
 /*
  * config()
  * ------------------------------------------------------------
@@ -488,6 +549,461 @@ static void print_processes(const Process processes[]) {
     }
 }
 
+/* get_total_cpu_time()
+ * ------------------------------------------------------------
+ * evaluation에서 waiting time을 계산하기 위해 한 process의 전체 CPU burst time 합을 반환
+ */
+static int get_total_cpu_time(const Process* process) {
+    int i;
+    int total = 0;
+
+    for (i = 0; i < process->cpu_burst_count; i++) {
+        total += process->cpu_bursts[i];
+    }
+
+    return total;
+}
+
+/* get_total_io_time()
+ * ------------------------------------------------------------
+ * evaluation에서 waiting time을 계산하기 위해 한 process의 전체 I/O burst time 합을 반환
+ */
+static int get_total_io_time(const Process* process) {
+    int i;
+    int total = 0;
+
+    for (i = 0; i < process->io_burst_count; i++) {
+        total += process->io_bursts[i];
+    }
+
+    return total;
+}
+
+/* add_gantt_segment()
+ * ------------------------------------------------------------
+ * Gantt chart에 새로운 실행 구간을 추가
+ * 같은 process가 바로 이어서 실행되는 경우에는 구간을 나누지 않고 기존 구간과 합침
+ */
+static void add_gantt_segment(GanttSegment gantt[], int* gantt_count, int process_index, int start_time, int end_time) {
+    if (start_time >= end_time) {
+        return;
+    }
+
+    if (*gantt_count > 0 &&
+        gantt[*gantt_count - 1].process_index == process_index &&
+        gantt[*gantt_count - 1].end_time == start_time) {
+        gantt[*gantt_count - 1].end_time = end_time;
+        return;
+    }
+
+    if (*gantt_count >= MAX_GANTT_SEGMENTS) {
+        printf("Warning: Gantt Chart segment limit exceeded.\n");
+        return;
+    }
+
+    gantt[*gantt_count].process_index = process_index;
+    gantt[*gantt_count].start_time = start_time;
+    gantt[*gantt_count].end_time = end_time;
+    (*gantt_count)++;
+}
+
+/* print_gantt_chart()
+ * ------------------------------------------------------------
+ * scheduling 결과로 만들어진 Gantt chart 출력
+ */
+static void print_gantt_chart(const GanttSegment gantt[], int gantt_count) {
+    int i;
+
+    printf("\nGantt Chart\n");
+    printf("------------------------------------------------------------\n");
+
+    for (i = 0; i < gantt_count; i++) {
+        if (gantt[i].process_index == IDLE_PROCESS) {
+            printf("| IDLE ");
+        }
+        else {
+            printf("| P%d ", gantt[i].process_index);
+        }
+    }
+    printf("|\n");
+
+    for (i = 0; i < gantt_count; i++) {
+        printf("%d", gantt[i].start_time);
+        printf("      ");
+    }
+
+    if (gantt_count > 0) {
+        printf("%d", gantt[gantt_count - 1].end_time);
+    }
+    printf("\n");
+}
+
+/* print_evaluation()
+ * ------------------------------------------------------------
+ * 각 process의 completion time, turnaround time, waiting time 출력
+ *
+ * turnaround time = completion time - arrival time
+ * waiting time    = turnaround time - total CPU time - total I/O time
+ */
+static void print_evaluation(const char* algorithm_name, const Process processes[], const int completion_time[]) {
+    int i;
+    int turnaround_time;
+    int waiting_time;
+    int total_turnaround_time = 0;
+    int total_waiting_time = 0;
+
+    printf("\n=== %s Evaluation ===\n", algorithm_name);
+    printf("%-6s %-8s %-11s %-12s %-12s %-8s %-8s\n",
+        "Name", "Arrival", "Completion", "Turnaround", "Waiting", "CPU", "I/O");
+    printf("------------------------------------------------------------------------\n");
+
+    for (i = 0; i < PROCESS_COUNT; i++) {
+        int total_cpu_time = get_total_cpu_time(&processes[i]);
+        int total_io_time = get_total_io_time(&processes[i]);
+
+        turnaround_time = completion_time[i] - processes[i].arrival_time;
+        waiting_time = turnaround_time - total_cpu_time - total_io_time;
+
+        total_turnaround_time += turnaround_time;
+        total_waiting_time += waiting_time;
+
+        printf("P%-5d %-8d %-11d %-12d %-12d %-8d %-8d\n",
+            i,
+            processes[i].arrival_time,
+            completion_time[i],
+            turnaround_time,
+            waiting_time,
+            total_cpu_time,
+            total_io_time);
+    }
+
+    printf("\nAverage Turnaround Time: %.2f\n", (double)total_turnaround_time / PROCESS_COUNT);
+    printf("Average Waiting Time   : %.2f\n", (double)total_waiting_time / PROCESS_COUNT);
+}
+
+/* find_next_event_time()
+ * ------------------------------------------------------------
+ * ready queue가 비어 있을 때 다음으로 발생할 event time을 찾는다.
+ *
+ * event 1: 새로운 process의 arrival
+ * event 2: waiting queue에 있는 process의 I/O completion
+ * 
+ * ready queue가 비어서 CPU가 idle 상태일 때는 위 time까지 current_time 값을 이동
+ * preemptive algorithm에서는 event time까지 CPU를 실행시키고 상황에 따라 재판단 수행
+ */
+static int find_next_event_time(const SchedulerConfig* scheduler_config, const Process processes[], const int io_completion_time[]) {
+    int i;
+    int next_event_time = INF;
+
+    if (scheduler_config->next_arrival_index < PROCESS_COUNT) {
+        next_event_time = processes[scheduler_config->next_arrival_index].arrival_time;
+    }
+
+    for (i = 0; i < PROCESS_COUNT; i++) {
+        if (io_completion_time[i] != -1 && io_completion_time[i] < next_event_time) {
+            next_event_time = io_completion_time[i];
+        }
+    }
+
+    return next_event_time;
+}
+
+/* update_ready_queue_until()
+ * ------------------------------------------------------------
+ * target_time까지 발생한 arrival 및 I/O completion event를 ready queue에 반영
+ *
+ * Non-preemptive algorithm에서는 CPU burst 도중 event가 발생해도 현재 process를 중단하지 않는다.
+ * 대신 CPU burst가 끝난 직후, 그동안 발생한 event들을 시간 순서대로 ready queue에 반영한다.
+ *
+ * Preemptive algorithm에서는 CPU를 next event time까지만 실행한 뒤 이 함수를 호출한다.
+ * 따라서 event 발생 시점마다 ready queue를 갱신하고 다시 scheduling 판단을 한다. (preempt 활성화)
+ */
+static void update_ready_queue_until(SchedulerConfig* scheduler_config, const Process processes[], int io_completion_time[], int target_time) {
+    int i;
+
+    while (1) {
+        int event_time = INF;
+
+        if (scheduler_config->next_arrival_index < PROCESS_COUNT && processes[scheduler_config->next_arrival_index].arrival_time <= target_time) {
+            event_time = processes[scheduler_config->next_arrival_index].arrival_time;
+        }
+
+        for (i = 0; i < PROCESS_COUNT; i++) {
+            if (io_completion_time[i] != -1 && io_completion_time[i] <= target_time && io_completion_time[i] < event_time) {
+                event_time = io_completion_time[i];
+            }
+        }
+
+        if (event_time == INF) {
+            break;
+        }
+
+        if (scheduler_config->current_time < event_time) {
+            scheduler_config->current_time = event_time;
+        }
+
+        while (scheduler_config->next_arrival_index < PROCESS_COUNT && processes[scheduler_config->next_arrival_index].arrival_time <= event_time) {
+            enqueue(&scheduler_config->ready_queue, scheduler_config->next_arrival_index);
+            scheduler_config->next_arrival_index++;
+        }
+
+        for (i = 0; i < PROCESS_COUNT; i++) {
+            if (io_completion_time[i] != -1 && io_completion_time[i] <= event_time) {
+                remove_from_queue(&scheduler_config->waiting_queue, i);
+                enqueue(&scheduler_config->ready_queue, i);
+                io_completion_time[i] = -1;
+            }
+        }
+    }
+
+    scheduler_config->current_time = target_time;
+}
+
+/* select_process_from_ready()
+ * ------------------------------------------------------------
+ * algorithm에 따른 선택 기준:
+ *  FCFS / RR      : ready queue의 첫 process
+ *  SJF 계열       : remaining CPU time이 가장 짧은 process
+ *  Priority 계열  : priority 값이 가장 작은 process
+ *
+ * 선택된 process는 ready queue에서 제거되고, 나머지 process들의 순서는 유지된다.
+ */
+static int select_process_from_ready(Queue* ready_queue, const Process processes[], const int remaining_cpu_time[], int algorithm) {
+    Queue temp;
+    int i;
+    int selected_position = -1;
+    int selected_process = -1;
+    int selected_value = INF;
+    int original_count = ready_queue->count;
+
+    if (is_queue_empty(ready_queue)) {
+        return -1;
+    }
+
+    if (algorithm == ALG_FCFS || algorithm == ALG_ROUND_ROBIN) {
+        return dequeue(ready_queue);
+    }
+
+    for (i = 0; i < original_count; i++) {
+        int queue_position = (ready_queue->front + i) % PROCESS_COUNT;
+        int process_index = ready_queue->data[queue_position];
+        int value;
+
+        if (algorithm == ALG_NON_PREEMPTIVE_SJF || algorithm == ALG_PREEMPTIVE_SJF) {
+            value = remaining_cpu_time[process_index];
+        }
+        else {
+            value = processes[process_index].priority;
+        }
+
+        if (selected_position == -1 || value < selected_value || (value == selected_value && process_index < selected_process)) {
+            selected_value = value;
+            selected_process = process_index;
+            selected_position = i;
+        }
+    }
+
+    init_queue(&temp);
+
+    for (i = 0; i < original_count; i++) {
+        int process_index = dequeue(ready_queue);
+
+        if (i != selected_position) {
+            enqueue(&temp, process_index);
+        }
+    }
+
+    *ready_queue = temp;
+    return selected_process;
+}
+
+/* get_algorithm_name()
+ * ------------------------------------------------------------
+ * algorithm index에 해당하는 이름 반환
+ * 문장 출력과 evaluation title에 사용
+ */
+static const char* get_algorithm_name(int algorithm) {
+    switch (algorithm) {
+    case ALG_FCFS:
+        return "FCFS";
+    case ALG_NON_PREEMPTIVE_SJF:
+        return "Non-Preemptive SJF";
+    case ALG_PREEMPTIVE_SJF:
+        return "Preemptive SJF";
+    case ALG_NON_PREEMPTIVE_PRIORITY:
+        return "Non-Preemptive Priority";
+    case ALG_PREEMPTIVE_PRIORITY:
+        return "Preemptive Priority";
+    case ALG_ROUND_ROBIN:
+        return "Round Robin";
+    default:
+        return "Unknown";
+    }
+}
+
+/* is_preemptive_algorithm()
+ * ------------------------------------------------------------
+ * event(arrival 또는 I/O event)가 발생했을 때 현재 실행 중인 process를 중단하고 다시 scheduling 판단을 해야 하는 algorithm인지 검사
+ */
+static int is_preemptive_algorithm(int algorithm) {
+    return algorithm == ALG_PREEMPTIVE_SJF ||
+        algorithm == ALG_PREEMPTIVE_PRIORITY;
+}
+
+/* get_run_end_time()
+ * ------------------------------------------------------------
+ * 선택된 process를 현재 시점에서 언제까지 실행할지 결정
+ *
+ * Non-preemptive algorithm:
+ *   현재 CPU burst가 끝날 때까지 실행
+ *
+ * Preemptive SJF / Preemptive Priority:
+ *   현재 CPU burst가 끝나기 전 arrival 또는 I/O completion event가 발생하면 그 event time까지만 실행하고 다시 process 선택
+ *
+ * Round Robin:
+ *   CPU burst completion과 time quantum 중 더 빠른 시점까지만 실행
+ */
+static int get_run_end_time(const SchedulerConfig* scheduler_config, const Process processes[], const int io_completion_time[], const int remaining_cpu_time[], int process_index, int algorithm) {
+    int cpu_finish_time = scheduler_config->current_time + remaining_cpu_time[process_index];
+    int run_end_time = cpu_finish_time;
+
+    if (algorithm == ALG_ROUND_ROBIN) {
+        int quantum_end_time =
+            scheduler_config->current_time + scheduler_config->time_quantum;
+
+        if (quantum_end_time < run_end_time) {
+            run_end_time = quantum_end_time;
+        }
+    }
+    else if (is_preemptive_algorithm(algorithm)) {
+        int next_event_time =
+            find_next_event_time(scheduler_config, processes, io_completion_time);
+
+        if (next_event_time < run_end_time) {
+            run_end_time = next_event_time;
+        }
+    }
+
+    return run_end_time;
+}
+
+/* run_scheduler()
+ * ------------------------------------------------------------
+ * FCFS, SJF, Priority, RR 실행시키는 공통 engine
+ *
+ * 공통 workflow:
+ *  1. process의 arrival 처리
+ *  2. I/O completion 처리
+ *  3. ready queue / waiting queue 관리
+ *  4. Gantt chart 기록
+ *  5. completion time 기록
+ *  6. evaluation 출력
+ *
+ * algorithm별 차이:
+ *  1. ready queue에서 어떤 process를 선택하는가
+ *  2. 선택된 process를 언제까지 실행하는가
+ *  3. 실행 후 아직 CPU burst가 남아 있으면 ready queue에 다시 넣을 것인가
+ */
+static void run_scheduler(const Process processes[], const SchedulerConfig* base_config, int algorithm) {
+    SchedulerConfig run_config = *base_config;
+    GanttSegment gantt[MAX_GANTT_SEGMENTS];
+    int gantt_count = 0;
+
+    int current_cpu_burst_index[PROCESS_COUNT];
+    int remaining_cpu_time[PROCESS_COUNT];
+    int io_completion_time[PROCESS_COUNT];
+    int completion_time[PROCESS_COUNT];
+    int completed_count = 0;
+    int i;
+
+    for (i = 0; i < PROCESS_COUNT; i++) {
+        current_cpu_burst_index[i] = 0;
+        remaining_cpu_time[i] = processes[i].cpu_bursts[0];
+        io_completion_time[i] = -1;
+        completion_time[i] = -1;
+    }
+
+    printf("\n=== %s Scheduling Result ===\n", get_algorithm_name(algorithm));
+
+    while (completed_count < PROCESS_COUNT) {
+        int process_index;
+        int run_start_time;
+        int run_end_time;
+        int executed_time;
+
+        update_ready_queue_until(&run_config, processes, io_completion_time, run_config.current_time);
+
+        if (is_queue_empty(&run_config.ready_queue)) {
+            int next_event_time = find_next_event_time(&run_config, processes, io_completion_time);
+
+            if (next_event_time == INF) {
+                break;
+            }
+
+            add_gantt_segment(gantt, &gantt_count, IDLE_PROCESS, run_config.current_time, next_event_time);
+
+            update_ready_queue_until(&run_config, processes, io_completion_time, next_event_time);
+            continue;
+        }
+
+        process_index = select_process_from_ready(&run_config.ready_queue, processes, remaining_cpu_time, algorithm);
+
+        if (process_index == -1) {
+            break;
+        }
+
+        run_start_time = run_config.current_time;
+
+        run_end_time = get_run_end_time(&run_config, processes, io_completion_time, remaining_cpu_time, process_index, algorithm);
+
+        executed_time = run_end_time - run_start_time;
+
+        if (executed_time <= 0) {
+            enqueue(&run_config.ready_queue, process_index);
+            update_ready_queue_until(&run_config, processes, io_completion_time, run_config.current_time);
+            continue;
+        }
+
+        add_gantt_segment(gantt, &gantt_count, process_index, run_start_time, run_end_time);
+
+        remaining_cpu_time[process_index] -= executed_time;
+        run_config.current_time = run_end_time;
+
+        update_ready_queue_until(&run_config, processes, io_completion_time, run_config.current_time);
+
+        if (remaining_cpu_time[process_index] == 0) {
+            current_cpu_burst_index[process_index]++;
+
+            if (current_cpu_burst_index[process_index] < processes[process_index].cpu_burst_count) {
+                int io_index = current_cpu_burst_index[process_index] - 1;
+
+                remaining_cpu_time[process_index] = processes[process_index].cpu_bursts[current_cpu_burst_index[process_index]];
+
+                io_completion_time[process_index] = run_config.current_time + processes[process_index].io_bursts[io_index];
+
+                enqueue(&run_config.waiting_queue, process_index);
+            }
+            else {
+                completion_time[process_index] = run_config.current_time;
+                completed_count++;
+            }
+        }
+        else {
+            /*
+             * CPU burst가 아직 끝나지 않았는데 실행이 멈춘 경우
+             *  - Preemptive algorithm: event 발생으로 재선택 필요
+             *  - RR: time quantum 만료
+             *
+             * 아직 실행할 CPU 시간이 남아 있는 process이므로 ready queue에 다시 삽입
+             */
+            enqueue(&run_config.ready_queue, process_index);
+        }
+    }
+
+    print_gantt_chart(gantt, gantt_count);
+    print_evaluation(get_algorithm_name(algorithm), processes, completion_time);
+}
+
 /*
  * clear_input_buffer()
  * ------------------------------------------------------------
@@ -545,96 +1061,60 @@ static int select_algorithm(void) {
     }
 }
 
-/*
- * print_algorithm_placeholder()
+/* run_fcfs()
  * ------------------------------------------------------------
- * 현재 단계에서는 algorithm 선택 기능만 먼저 구현
- * 실제 scheduling logic, Gantt Chart, Evaluation은 다음 단계에서 각각 구현 예정
- */
-static void print_algorithm_placeholder(const char* algorithm_name, const SchedulerConfig* scheduler_config) {
-    printf("\n=== %s Scheduling Result ===\n", algorithm_name);
-    printf("Algorithm selected successfully.\n");
-
-    /* 선택된 algorithm이 동일한 초기 환경에서 계산되는지 확인용 */
-    print_config(scheduler_config);
-}
-
-/*
- * run_fcfs()
- * ------------------------------------------------------------
- * FCFS scheduling을 실행할 함수
- * 현재는 menu 연결 확인용 skeleton만 작성
+ * FCFS scheduling 실행 함수
+ *
+ * 실제 scheduling loop는 공통 함수 run_scheduler()에서 수행하는 것으로 끝난다.
  */
 static void run_fcfs(const Process processes[], const SchedulerConfig* base_config) {
-    SchedulerConfig run_config = *base_config;
-
-    (void)processes;
-    print_algorithm_placeholder("FCFS", &run_config);
+    run_scheduler(processes, base_config, ALG_FCFS);
 }
 
-/*
- * run_non_preemptive_sjf()
+/* run_non_preemptive_sjf()
  * ------------------------------------------------------------
- * Non-Preemptive SJF scheduling을 실행할 함수
- * 현재는 menu 연결 확인용 skeleton만 작성
+ * Non-Preemptive SJF scheduling 실행 함수
+ *
+ * 실제 scheduling loop는 공통 함수 run_scheduler()에서 수행하는 것으로 끝난다.
  */
 static void run_non_preemptive_sjf(const Process processes[], const SchedulerConfig* base_config) {
-    SchedulerConfig run_config = *base_config;
-
-    (void)processes;
-    print_algorithm_placeholder("Non-Preemptive SJF", &run_config);
+    run_scheduler(processes, base_config, ALG_NON_PREEMPTIVE_SJF);
 }
 
-/*
- * run_preemptive_sjf()
+/* run_preemptive_sjf()
  * ------------------------------------------------------------
- * Preemptive SJF scheduling을 실행할 함수
- * 현재는 menu 연결 확인용 skeleton만 작성
+ * 기존 skeleton 대신 공통 scheduler engine을 호출
  */
-static void run_preemptive_sjf(const Process processes[], const SchedulerConfig* base_config) {
-    SchedulerConfig run_config = *base_config;
-
-    (void)processes;
-    print_algorithm_placeholder("Preemptive SJF", &run_config);
+static void run_preemptive_sjf(const Process processes[],
+    const SchedulerConfig* base_config) {
+    run_scheduler(processes, base_config, ALG_PREEMPTIVE_SJF);
 }
 
-/*
- * run_non_preemptive_priority()
+/* run_non_preemptive_priority()
  * ------------------------------------------------------------
- * Non-Preemptive Priority scheduling을 실행할 함수
- * 현재는 menu 연결 확인용 skeleton만 작성
+ * 기존 skeleton 대신 공통 scheduler engine을 호출
  */
-static void run_non_preemptive_priority(const Process processes[], const SchedulerConfig* base_config) {
-    SchedulerConfig run_config = *base_config;
-
-    (void)processes;
-    print_algorithm_placeholder("Non-Preemptive Priority", &run_config);
+static void run_non_preemptive_priority(const Process processes[],
+    const SchedulerConfig* base_config) {
+    run_scheduler(processes, base_config, ALG_NON_PREEMPTIVE_PRIORITY);
 }
 
-/*
- * run_preemptive_priority()
+/* run_preemptive_priority()
  * ------------------------------------------------------------
- * Preemptive Priority scheduling을 실행할 함수
- * 현재는 menu 연결 확인용 skeleton만 작성
+ * 기존 skeleton 대신 공통 scheduler engine을 호출
  */
-static void run_preemptive_priority(const Process processes[], const SchedulerConfig* base_config) {
-    SchedulerConfig run_config = *base_config;
-
-    (void)processes;
-    print_algorithm_placeholder("Preemptive Priority", &run_config);
+static void run_preemptive_priority(const Process processes[],
+    const SchedulerConfig* base_config) {
+    run_scheduler(processes, base_config, ALG_PREEMPTIVE_PRIORITY);
 }
 
-/*
- * run_round_robin()
+/* run_round_robin()
  * ------------------------------------------------------------
- * Round Robin scheduling을 실행할 함수
- * 현재는 menu 연결 확인용 skeleton만 작성
+ * 기존 skeleton 대신 공통 scheduler engine을 호출
  */
-static void run_round_robin(const Process processes[], const SchedulerConfig* base_config) {
-    SchedulerConfig run_config = *base_config;
-
-    (void)processes;
-    print_algorithm_placeholder("Round Robin", &run_config);
+static void run_round_robin(const Process processes[],
+    const SchedulerConfig* base_config) {
+    run_scheduler(processes, base_config, ALG_ROUND_ROBIN);
 }
 
 /*
