@@ -80,6 +80,7 @@
 #define ALG_NON_PREEMPTIVE_PRIORITY 4
 #define ALG_PREEMPTIVE_PRIORITY 5
 #define ALG_ROUND_ROBIN 6
+#define ALG_LOTTERY 7
 
 /*
  * Process 구조체
@@ -759,12 +760,30 @@ static void update_ready_queue_until(SchedulerConfig* scheduler_config, const Pr
     scheduler_config->current_time = target_time;
 }
 
+/* get_lottery_ticket_count()
+ * ------------------------------------------------------------
+ * lottery scheduling에서 process가 받을 ticket 개수를 할당
+ * priority가 높을수록 더 많은 ticket을 받아야 한다.
+ * 따라서 ticket 수는 priority와 반비례 관계
+ *   priority 1 -> 5 tickets
+ *   priority 2 -> 4 tickets
+ *   priority 3 -> 3 tickets
+ *   priority 4 -> 2 tickets
+ *   priority 5 -> 1 ticket
+ */
+static int get_lottery_ticket_count(const Process* process) {
+    return MAX_PRIORITY - process->priority + 1;
+}
+
 /* select_process_from_ready()
  * ------------------------------------------------------------
- * algorithm에 따른 선택 기준:
+ * algorithm에 따른 기준으로 ready queue에서 실행할 process를 선택
+ *
+ * algorithm별 선택 기준:
  *  FCFS / RR      : ready queue의 첫 process
  *  SJF 계열       : remaining CPU time이 가장 짧은 process
  *  Priority 계열  : priority 값이 가장 작은 process
+ *  Lottery        : priority에 따라 ticket을 부여하고 random ticket으로 선택
  *
  * 선택된 process는 ready queue에서 제거되고, 나머지 process들의 순서는 유지된다.
  */
@@ -780,29 +799,89 @@ static int select_process_from_ready(Queue* ready_queue, const Process processes
         return -1;
     }
 
+    /*
+     * FCFS와 Round Robin은 ready queue에 먼저 들어온 process를 선택
+     */
     if (algorithm == ALG_FCFS || algorithm == ALG_ROUND_ROBIN) {
         return dequeue(ready_queue);
     }
 
-    for (i = 0; i < original_count; i++) {
-        int queue_position = (ready_queue->front + i) % PROCESS_COUNT;
-        int process_index = ready_queue->data[queue_position];
-        int value;
+    /*
+     * Lottery Scheduling
+     * ------------------------------------------------------------
+     * ready queue 안에 있는 process들에게 ticket을 부여하고,
+     * 1부터 total_tickets 사이의 ticket 번호를 random으로 뽑는다.
+     *
+     * ticket을 많이 가진 process일수록 선택될 확률이 높다.
+     */
+    if (algorithm == ALG_LOTTERY) {
+        int total_tickets = 0;
+        int winning_ticket;
+        int ticket_sum = 0;
 
-        if (algorithm == ALG_NON_PREEMPTIVE_SJF || algorithm == ALG_PREEMPTIVE_SJF) {
-            value = remaining_cpu_time[process_index];
-        }
-        else {
-            value = processes[process_index].priority;
+        /*
+         * ready queue에 있는 process들의 ticket 총합 계산
+         */
+        for (i = 0; i < original_count; i++) {
+            int queue_position = (ready_queue->front + i) % PROCESS_COUNT;
+            int process_index = ready_queue->data[queue_position];
+
+            total_tickets += get_lottery_ticket_count(&processes[process_index]);
         }
 
-        if (selected_position == -1 || value < selected_value || (value == selected_value && process_index < selected_process)) {
-            selected_value = value;
-            selected_process = process_index;
-            selected_position = i;
+        /*
+         * 1부터 total_tickets 사이에서 당첨 ticket 번호를 random으로 선택
+         */
+        winning_ticket = random_between(1, total_tickets);
+
+        /*
+         * ready queue 순서대로 ticket 범위를 누적하면서
+         * winning_ticket을 포함하는 process를 찾는다.
+         */
+        for (i = 0; i < original_count; i++) {
+            int queue_position = (ready_queue->front + i) % PROCESS_COUNT;
+            int process_index = ready_queue->data[queue_position];
+
+            ticket_sum += get_lottery_ticket_count(&processes[process_index]);
+
+            if (winning_ticket <= ticket_sum) {
+                selected_position = i;
+                selected_process = process_index;
+                break;
+            }
+        }
+    }
+    else {
+        /*
+         * SJF / Priority Scheduling
+         * ------------------------------------------------------------
+         * SJF는 remaining CPU time이 가장 짧은 process 선택
+         * Priority는 priority 값이 가장 작은 process 선택
+         */
+        for (i = 0; i < original_count; i++) {
+            int queue_position = (ready_queue->front + i) % PROCESS_COUNT;
+            int process_index = ready_queue->data[queue_position];
+            int value;
+
+            if (algorithm == ALG_NON_PREEMPTIVE_SJF || algorithm == ALG_PREEMPTIVE_SJF) {
+                value = remaining_cpu_time[process_index];
+            }
+            else {
+                value = processes[process_index].priority;
+            }
+
+            if (selected_position == -1 || value < selected_value || (value == selected_value && process_index < selected_process)) {
+                selected_value = value;
+                selected_process = process_index;
+                selected_position = i;
+            }
         }
     }
 
+    /*
+     * circular queue에서는 중간 element를 바로 제거하기 어렵기 때문에,
+     * 선택된 process만 제외하고 temp queue에 다시 넣는다.
+     */
     init_queue(&temp);
 
     for (i = 0; i < original_count; i++) {
@@ -836,6 +915,8 @@ static const char* get_algorithm_name(int algorithm) {
         return "Preemptive Priority";
     case ALG_ROUND_ROBIN:
         return "Round Robin";
+    case ALG_LOTTERY:
+        return "Lottery";
     default:
         return "Unknown";
     }
@@ -867,7 +948,7 @@ static int get_run_end_time(const SchedulerConfig* scheduler_config, const Proce
     int cpu_finish_time = scheduler_config->current_time + remaining_cpu_time[process_index];
     int run_end_time = cpu_finish_time;
 
-    if (algorithm == ALG_ROUND_ROBIN) {
+    if (algorithm == ALG_ROUND_ROBIN || algorithm == ALG_LOTTERY) {
         int quantum_end_time =
             scheduler_config->current_time + scheduler_config->time_quantum;
 
@@ -889,7 +970,7 @@ static int get_run_end_time(const SchedulerConfig* scheduler_config, const Proce
 
 /* run_scheduler()
  * ------------------------------------------------------------
- * FCFS, SJF, Priority, RR 실행시키는 공통 engine
+ * FCFS, SJF, Priority, RR, Lottery algorithm을 실행시키는 공통 engine
  *
  * 공통 workflow:
  *  1. process의 arrival 처리
@@ -1029,6 +1110,7 @@ static void print_algorithm_menu(void) {
     printf("4. Non-Preemptive Priority\n");
     printf("5. Preemptive Priority\n");
     printf("6. Round Robin\n");
+    printf("7. Lottery\n");
     printf("0. Exit\n");
 }
 
@@ -1038,7 +1120,7 @@ static void print_algorithm_menu(void) {
  * menu에서 사용자의 입력을 받아 scheduling algorithm 번호를 반환
  *
  * return 0: simulator 종료
- * return 1~6: 각 scheduling algorithm과 대응
+ * return 1~7: 각 scheduling algorithm과 대응
  */
 static int select_algorithm(void) {
     int choice;
@@ -1053,7 +1135,7 @@ static int select_algorithm(void) {
             continue;
         }
 
-        if (choice >= 0 && choice <= 6) {
+        if (choice >= 0 && choice <= 7) {
             return choice;
         }
 
@@ -1083,7 +1165,10 @@ static void run_non_preemptive_sjf(const Process processes[], const SchedulerCon
 
 /* run_preemptive_sjf()
  * ------------------------------------------------------------
- * 기존 skeleton 대신 공통 scheduler engine을 호출
+ * preemptive SJF scheduling 실행 함수
+ * 
+ * 실제 scheduling loop는 공통 함수 run_scheduler()에서 수행하고,
+ * 여기서는 preemptive SJF 방식으로 실행하도록 algorithm 번호만 전달한다.
  */
 static void run_preemptive_sjf(const Process processes[],
     const SchedulerConfig* base_config) {
@@ -1092,7 +1177,10 @@ static void run_preemptive_sjf(const Process processes[],
 
 /* run_non_preemptive_priority()
  * ------------------------------------------------------------
- * 기존 skeleton 대신 공통 scheduler engine을 호출
+ * non-preemptive priority scheduling 실행 함수
+ * 
+ * 실제 scheduling loop는 공통 함수 run_scheduler()에서 수행하고,
+ * 여기서는 non-preemptive priority 방식으로 실행하도록 algorithm 번호만 전달한다.
  */
 static void run_non_preemptive_priority(const Process processes[],
     const SchedulerConfig* base_config) {
@@ -1101,7 +1189,10 @@ static void run_non_preemptive_priority(const Process processes[],
 
 /* run_preemptive_priority()
  * ------------------------------------------------------------
- * 기존 skeleton 대신 공통 scheduler engine을 호출
+ * preemptive priority scheduling 실행 함수
+ * 
+ * 실제 scheduling loop는 공통 함수 run_scheduler()에서 수행하고,
+ * 여기서는 preemptive priority 방식으로 실행하도록 algorithm 번호만 전달한다.
  */
 static void run_preemptive_priority(const Process processes[],
     const SchedulerConfig* base_config) {
@@ -1110,11 +1201,25 @@ static void run_preemptive_priority(const Process processes[],
 
 /* run_round_robin()
  * ------------------------------------------------------------
- * 기존 skeleton 대신 공통 scheduler engine을 호출
+ * RR scheduling 실행 함수
+ * 
+ * 실제 scheduling loop는 공통 함수 run_scheduler()에서 수행하고,
+ * 여기서는 RR 방식으로 실행하도록 algorithm 번호만 전달한다.
  */
 static void run_round_robin(const Process processes[],
     const SchedulerConfig* base_config) {
     run_scheduler(processes, base_config, ALG_ROUND_ROBIN);
+}
+
+/* run_lottery()
+ * ------------------------------------------------------------
+ * Lottery scheduling 실행 함수
+ *
+ * 실제 scheduling loop는 공통 함수 run_scheduler()에서 수행하고,
+ * 여기서는 Lottery 방식으로 실행하도록 algorithm 번호만 전달한다.
+ */
+static void run_lottery(const Process processes[], const SchedulerConfig* base_config) {
+    run_scheduler(processes, base_config, ALG_LOTTERY);
 }
 
 /*
@@ -1143,6 +1248,9 @@ static void schedule(int selected_algorithm, const Process processes[], const Sc
         break;
     case 6:
         run_round_robin(processes, base_config);
+        break;
+    case 7:
+        run_lottery(processes, base_config);
         break;
     default:
         printf("Invalid algorithm selected.\n");
