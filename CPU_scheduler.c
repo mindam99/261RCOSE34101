@@ -608,7 +608,8 @@ static void add_gantt_segment(GanttSegment gantt[], int* gantt_count, int proces
     (*gantt_count)++;
 }
 
-/* print_gantt_chart()
+/*
+ * print_gantt_chart()
  * ------------------------------------------------------------
  * scheduling 결과로 만들어진 Gantt chart 출력
  */
@@ -618,24 +619,24 @@ static void print_gantt_chart(const GanttSegment gantt[], int gantt_count) {
     printf("\nGantt Chart\n");
     printf("------------------------------------------------------------\n");
 
+    if (gantt_count == 0) {
+        printf("(empty)\n");
+        return;
+    }
+
+    printf("[%d]", gantt[0].start_time);
+
     for (i = 0; i < gantt_count; i++) {
         if (gantt[i].process_index == IDLE_PROCESS) {
-            printf("| IDLE ");
+            printf("--IDLE--");
         }
         else {
-            printf("| P%d ", gantt[i].process_index);
+            printf("--P%d--", gantt[i].process_index);
         }
-    }
-    printf("|\n");
 
-    for (i = 0; i < gantt_count; i++) {
-        printf("%d", gantt[i].start_time);
-        printf("      ");
+        printf("[%d]", gantt[i].end_time);
     }
 
-    if (gantt_count > 0) {
-        printf("%d", gantt[gantt_count - 1].end_time);
-    }
     printf("\n");
 }
 
