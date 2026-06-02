@@ -81,6 +81,8 @@
 #define ALG_PREEMPTIVE_PRIORITY 5
 #define ALG_ROUND_ROBIN 6
 #define ALG_LOTTERY 7
+#define ALG_LJF 8
+#define ALG_HRRN 9
 
 /*
  * Process 구조체
@@ -456,8 +458,7 @@ static void config(SchedulerConfig* scheduler_config, const Process processes[])
     scheduler_config->time_quantum = DEFAULT_TIME_QUANTUM;
 
     /* arrival_time이 0인 process는 scheduling 시작 시점부터 바로 ready queue에 들어갈 수 있음 */
-    while (scheduler_config->next_arrival_index < PROCESS_COUNT &&
-        processes[scheduler_config->next_arrival_index].arrival_time <= scheduler_config->current_time) {
+    while (scheduler_config->next_arrival_index < PROCESS_COUNT && processes[scheduler_config->next_arrival_index].arrival_time <= scheduler_config->current_time) {
         enqueue(&scheduler_config->ready_queue, scheduler_config->next_arrival_index);
         scheduler_config->next_arrival_index++;
     }
@@ -529,13 +530,7 @@ static void print_processes(const Process processes[]) {
     printf("--------------------------------------------------------------------------------\n");
 
     for (i = 0; i < PROCESS_COUNT; i++) {
-        printf("P%-5d %-6d %-8d %-8d %-7d %-6d ",
-               i,
-               processes[i].pid,
-               processes[i].arrival_time,
-               processes[i].priority,
-               processes[i].cpu_burst_count,
-               processes[i].io_burst_count);
+        printf("P%-5d %-6d %-8d %-8d %-7d %-6d ", i, processes[i].pid, processes[i].arrival_time, processes[i].priority, processes[i].cpu_burst_count, processes[i].io_burst_count);
 
         /* burst sequence 출력 코드 */
         for (j = 0; j < processes[i].cpu_burst_count; j++) {
@@ -590,9 +585,7 @@ static void add_gantt_segment(GanttSegment gantt[], int* gantt_count, int proces
         return;
     }
 
-    if (*gantt_count > 0 &&
-        gantt[*gantt_count - 1].process_index == process_index &&
-        gantt[*gantt_count - 1].end_time == start_time) {
+    if (*gantt_count > 0 && gantt[*gantt_count - 1].process_index == process_index && gantt[*gantt_count - 1].end_time == start_time) {
         gantt[*gantt_count - 1].end_time = end_time;
         return;
     }
@@ -669,14 +662,7 @@ static void print_evaluation(const char* algorithm_name, const Process processes
         total_turnaround_time += turnaround_time;
         total_waiting_time += waiting_time;
 
-        printf("P%-5d %-8d %-11d %-12d %-12d %-8d %-8d\n",
-            i,
-            processes[i].arrival_time,
-            completion_time[i],
-            turnaround_time,
-            waiting_time,
-            total_cpu_time,
-            total_io_time);
+        printf("P%-5d %-8d %-11d %-12d %-12d %-8d %-8d\n", i, processes[i].arrival_time, completion_time[i], turnaround_time, waiting_time, total_cpu_time, total_io_time);
     }
 
     printf("\nAverage Turnaround Time: %.2f\n", (double)total_turnaround_time / PROCESS_COUNT);
@@ -719,45 +705,83 @@ static int find_next_event_time(const SchedulerConfig* scheduler_config, const P
  *
  * Preemptive algorithm에서는 CPU를 next event time까지만 실행한 뒤 이 함수를 호출한다.
  * 따라서 event 발생 시점마다 ready queue를 갱신하고 다시 scheduling 판단을 한다. (preempt 활성화)
+ * 
+ * ready_enter_time[]은 HRRN에서 ready queue waiting time을 계산하기 위해 사용한다.
+ * process가 ready queue에 들어가는 시점을 저장해 두면,
+ * HRRN 선택 시점에서 current_time - ready_enter_time[process]로 해당 process가 ready queue에서 얼마나 기다렸는지 계산할 수 있다.
  */
-static void update_ready_queue_until(SchedulerConfig* scheduler_config, const Process processes[], int io_completion_time[], int target_time) {
+static void update_ready_queue_until(SchedulerConfig* scheduler_config, const Process processes[], int io_completion_time[], int ready_enter_time[], int target_time) {
     int i;
 
     while (1) {
         int event_time = INF;
 
+        /*
+         * 아직 ready queue에 들어가지 않은 process 중 target_time까지 도착한 process가 있으면 그 arrival time을 event 후보로 둔다.
+         */
         if (scheduler_config->next_arrival_index < PROCESS_COUNT && processes[scheduler_config->next_arrival_index].arrival_time <= target_time) {
             event_time = processes[scheduler_config->next_arrival_index].arrival_time;
         }
 
+        /*
+         * I/O completion event 중 target_time 안에 발생하는 가장 빠른 시간을 찾는다.
+         */
         for (i = 0; i < PROCESS_COUNT; i++) {
             if (io_completion_time[i] != -1 && io_completion_time[i] <= target_time && io_completion_time[i] < event_time) {
                 event_time = io_completion_time[i];
             }
         }
 
+        /*
+         * target_time까지 처리할 arrival 또는 I/O completion event가 없으면 종료
+         */
         if (event_time == INF) {
             break;
         }
 
+        /*
+         * scheduler의 현재 시간을 event_time으로 이동
+         */
         if (scheduler_config->current_time < event_time) {
             scheduler_config->current_time = event_time;
         }
 
+        /*
+         * event_time까지 도착한 process들을 ready queue에 삽입
+         *
+         * HRRN 계산을 위해 ready queue에 들어간 시점도 함께 기록한다.
+         */
         while (scheduler_config->next_arrival_index < PROCESS_COUNT && processes[scheduler_config->next_arrival_index].arrival_time <= event_time) {
-            enqueue(&scheduler_config->ready_queue, scheduler_config->next_arrival_index);
+            int arrived_process = scheduler_config->next_arrival_index;
+
+            ready_enter_time[arrived_process] = event_time;
+            enqueue(&scheduler_config->ready_queue, arrived_process);
+
             scheduler_config->next_arrival_index++;
         }
 
+        /*
+         * event_time까지 I/O가 끝난 process들을
+         * waiting queue에서 제거한 뒤 ready queue로 이동
+         *
+         * I/O 완료 후 다시 ready queue에 들어온 시점도 기록한다.
+         */
         for (i = 0; i < PROCESS_COUNT; i++) {
             if (io_completion_time[i] != -1 && io_completion_time[i] <= event_time) {
                 remove_from_queue(&scheduler_config->waiting_queue, i);
+
+                ready_enter_time[i] = event_time;
                 enqueue(&scheduler_config->ready_queue, i);
+
                 io_completion_time[i] = -1;
             }
         }
     }
 
+    /*
+     * target_time까지의 event 처리가 끝났으므로
+     * scheduler의 current_time을 target_time으로 맞춘다.
+     */
     scheduler_config->current_time = target_time;
 }
 
@@ -785,10 +809,12 @@ static int get_lottery_ticket_count(const Process* process) {
  *  SJF 계열       : remaining CPU time이 가장 짧은 process
  *  Priority 계열  : priority 값이 가장 작은 process
  *  Lottery        : priority에 따라 ticket을 부여하고 random ticket으로 선택
+ *  LJF            : remaining CPU time이 가장 긴 process
+ *  HRRN           : response ratio가 가장 큰 process
  *
  * 선택된 process는 ready queue에서 제거되고, 나머지 process들의 순서는 유지된다.
  */
-static int select_process_from_ready(Queue* ready_queue, const Process processes[], const int remaining_cpu_time[], int algorithm) {
+static int select_process_from_ready(Queue* ready_queue, const Process processes[], const int remaining_cpu_time[], const int ready_enter_time[], int current_time, int algorithm) {
     Queue temp;
     int i;
     int selected_position = -1;
@@ -812,17 +838,12 @@ static int select_process_from_ready(Queue* ready_queue, const Process processes
      * ------------------------------------------------------------
      * ready queue 안에 있는 process들에게 ticket을 부여하고,
      * 1부터 total_tickets 사이의 ticket 번호를 random으로 뽑는다.
-     *
-     * ticket을 많이 가진 process일수록 선택될 확률이 높다.
      */
     if (algorithm == ALG_LOTTERY) {
         int total_tickets = 0;
         int winning_ticket;
         int ticket_sum = 0;
 
-        /*
-         * ready queue에 있는 process들의 ticket 총합 계산
-         */
         for (i = 0; i < original_count; i++) {
             int queue_position = (ready_queue->front + i) % PROCESS_COUNT;
             int process_index = ready_queue->data[queue_position];
@@ -830,15 +851,8 @@ static int select_process_from_ready(Queue* ready_queue, const Process processes
             total_tickets += get_lottery_ticket_count(&processes[process_index]);
         }
 
-        /*
-         * 1부터 total_tickets 사이에서 당첨 ticket 번호를 random으로 선택
-         */
         winning_ticket = random_between(1, total_tickets);
 
-        /*
-         * ready queue 순서대로 ticket 범위를 누적하면서
-         * winning_ticket을 포함하는 process를 찾는다.
-         */
         for (i = 0; i < original_count; i++) {
             int queue_position = (ready_queue->front + i) % PROCESS_COUNT;
             int process_index = ready_queue->data[queue_position];
@@ -852,29 +866,81 @@ static int select_process_from_ready(Queue* ready_queue, const Process processes
             }
         }
     }
+    /*
+     * HRRN Scheduling
+     * ------------------------------------------------------------
+     * response ratio가 가장 큰 process를 선택한다.
+     *
+     * response ratio = (waiting time + CPU burst time) / CPU burst time
+     *
+     * waiting time은 ready queue에 들어온 시점부터
+     * 현재 scheduling 시점까지의 시간이다.
+     */
+    else if (algorithm == ALG_HRRN) {
+        double selected_response_ratio = -1.0;
+
+        for (i = 0; i < original_count; i++) {
+            int queue_position = (ready_queue->front + i) % PROCESS_COUNT;
+            int process_index = ready_queue->data[queue_position];
+            int cpu_time = remaining_cpu_time[process_index];
+            int waiting_time;
+            double response_ratio;
+
+            if (ready_enter_time[process_index] == -1) {
+                waiting_time = 0;
+            }
+            else {
+                waiting_time = current_time - ready_enter_time[process_index];
+            }
+
+            response_ratio = (double)(waiting_time + cpu_time) / cpu_time;
+
+            if (selected_position == -1 || response_ratio > selected_response_ratio || (response_ratio == selected_response_ratio && process_index < selected_process)) {
+                selected_response_ratio = response_ratio;
+                selected_process = process_index;
+                selected_position = i;
+            }
+        }
+    }
     else {
         /*
-         * SJF / Priority Scheduling
+         * SJF / LJF / Priority Scheduling
          * ------------------------------------------------------------
-         * SJF는 remaining CPU time이 가장 짧은 process 선택
-         * Priority는 priority 값이 가장 작은 process 선택
+         * SJF      : remaining CPU time이 가장 짧은 process 선택
+         * LJF      : remaining CPU time이 가장 긴 process 선택
+         * Priority : priority 값이 가장 작은 process 선택
          */
         for (i = 0; i < original_count; i++) {
             int queue_position = (ready_queue->front + i) % PROCESS_COUNT;
             int process_index = ready_queue->data[queue_position];
             int value;
 
-            if (algorithm == ALG_NON_PREEMPTIVE_SJF || algorithm == ALG_PREEMPTIVE_SJF) {
+            if (algorithm == ALG_NON_PREEMPTIVE_SJF || algorithm == ALG_PREEMPTIVE_SJF || algorithm == ALG_LJF) {
                 value = remaining_cpu_time[process_index];
             }
             else {
                 value = processes[process_index].priority;
             }
 
-            if (selected_position == -1 || value < selected_value || (value == selected_value && process_index < selected_process)) {
-                selected_value = value;
-                selected_process = process_index;
-                selected_position = i;
+            /*
+             * LJF는 값이 클수록 먼저 선택
+             */
+            if (algorithm == ALG_LJF) {
+                if (selected_position == -1 || value > selected_value || (value == selected_value && process_index < selected_process)) {
+                    selected_value = value;
+                    selected_process = process_index;
+                    selected_position = i;
+                }
+            }
+            /*
+             * SJF와 Priority는 값이 작을수록 먼저 선택
+             */
+            else {
+                if (selected_position == -1 || value < selected_value || (value == selected_value && process_index < selected_process)) {
+                    selected_value = value;
+                    selected_process = process_index;
+                    selected_position = i;
+                }
             }
         }
     }
@@ -918,6 +984,10 @@ static const char* get_algorithm_name(int algorithm) {
         return "Round Robin";
     case ALG_LOTTERY:
         return "Lottery";
+    case ALG_LJF:
+        return "Longest Job First";
+    case ALG_HRRN:
+        return "HRRN";
     default:
         return "Unknown";
     }
@@ -942,7 +1012,7 @@ static int is_preemptive_algorithm(int algorithm) {
  * Preemptive SJF / Preemptive Priority:
  *   현재 CPU burst가 끝나기 전 arrival 또는 I/O completion event가 발생하면 그 event time까지만 실행하고 다시 process 선택
  *
- * Round Robin:
+ * Round Robin / Lottery:
  *   CPU burst completion과 time quantum 중 더 빠른 시점까지만 실행
  */
 static int get_run_end_time(const SchedulerConfig* scheduler_config, const Process processes[], const int io_completion_time[], const int remaining_cpu_time[], int process_index, int algorithm) {
@@ -950,16 +1020,14 @@ static int get_run_end_time(const SchedulerConfig* scheduler_config, const Proce
     int run_end_time = cpu_finish_time;
 
     if (algorithm == ALG_ROUND_ROBIN || algorithm == ALG_LOTTERY) {
-        int quantum_end_time =
-            scheduler_config->current_time + scheduler_config->time_quantum;
+        int quantum_end_time = scheduler_config->current_time + scheduler_config->time_quantum;
 
         if (quantum_end_time < run_end_time) {
             run_end_time = quantum_end_time;
         }
     }
     else if (is_preemptive_algorithm(algorithm)) {
-        int next_event_time =
-            find_next_event_time(scheduler_config, processes, io_completion_time);
+        int next_event_time = find_next_event_time(scheduler_config, processes, io_completion_time);
 
         if (next_event_time < run_end_time) {
             run_end_time = next_event_time;
@@ -971,8 +1039,11 @@ static int get_run_end_time(const SchedulerConfig* scheduler_config, const Proce
 
 /* run_scheduler()
  * ------------------------------------------------------------
- * FCFS, SJF, Priority, RR, Lottery algorithm을 실행시키는 공통 engine
+ * FCFS, SJF, Priority, RR, Lottery, LJF, HRRN algorithm을 실행시키는 공통 engine
  *
+ * HRRN을 위해 ready_enter_time[]을 추가로 관리한다.
+ * ready_enter_time[i]는 Pi가 ready queue에 들어온 시간을 의미한다.
+ * 
  * 공통 workflow:
  *  1. process의 arrival 처리
  *  2. I/O completion 처리
@@ -993,16 +1064,47 @@ static void run_scheduler(const Process processes[], const SchedulerConfig* base
 
     int current_cpu_burst_index[PROCESS_COUNT];
     int remaining_cpu_time[PROCESS_COUNT];
+
+    /*
+     * HRRN에서 ready queue waiting time을 계산하기 위한 배열
+     * -1이면 현재 ready queue에 없는 상태
+     */
+    int ready_enter_time[PROCESS_COUNT];
+
     int io_completion_time[PROCESS_COUNT];
     int completion_time[PROCESS_COUNT];
     int completed_count = 0;
     int i;
 
+    /*
+     * process별 runtime 상태 초기화
+     */
     for (i = 0; i < PROCESS_COUNT; i++) {
         current_cpu_burst_index[i] = 0;
         remaining_cpu_time[i] = processes[i].cpu_bursts[0];
+        ready_enter_time[i] = -1;
         io_completion_time[i] = -1;
         completion_time[i] = -1;
+    }
+
+    /*
+     * config()에서 이미 ready queue에 들어간 process들의 ready enter time 기록
+     *
+     * 예:
+     *   arrival_time이 0인 process들은 config() 단계에서 이미 ready queue에 들어가 있음
+     *   따라서 HRRN 계산을 위해 ready_enter_time을 current_time으로 설정
+     *
+     * 실제 ready queue를 직접 dequeue하면 queue가 망가지므로,
+     * 복사본 temp_ready_queue를 사용한다.
+     */
+    {
+        Queue temp_ready_queue = run_config.ready_queue;
+        int process_index;
+
+        while (!is_queue_empty(&temp_ready_queue)) {
+            process_index = dequeue(&temp_ready_queue);
+            ready_enter_time[process_index] = run_config.current_time;
+        }
     }
 
     printf("\n=== %s Scheduling Result ===\n", get_algorithm_name(algorithm));
@@ -1013,8 +1115,17 @@ static void run_scheduler(const Process processes[], const SchedulerConfig* base
         int run_end_time;
         int executed_time;
 
-        update_ready_queue_until(&run_config, processes, io_completion_time, run_config.current_time);
+        /*
+         * 현재 시간까지 발생한 arrival / I/O completion event를 ready queue에 반영
+         *
+         * HRRN 계산을 위해 ready_enter_time[]도 함께 갱신한다.
+         */
+        update_ready_queue_until(&run_config, processes, io_completion_time, ready_enter_time, run_config.current_time);
 
+        /*
+         * ready queue가 비어 있으면 CPU가 실행할 process가 없는 상태
+         * 다음 arrival 또는 I/O completion event까지 IDLE 구간으로 처리
+         */
         if (is_queue_empty(&run_config.ready_queue)) {
             int next_event_time = find_next_event_time(&run_config, processes, io_completion_time);
 
@@ -1024,39 +1135,82 @@ static void run_scheduler(const Process processes[], const SchedulerConfig* base
 
             add_gantt_segment(gantt, &gantt_count, IDLE_PROCESS, run_config.current_time, next_event_time);
 
-            update_ready_queue_until(&run_config, processes, io_completion_time, next_event_time);
+            update_ready_queue_until(&run_config, processes, io_completion_time, ready_enter_time, next_event_time);
+
             continue;
         }
 
-        process_index = select_process_from_ready(&run_config.ready_queue, processes, remaining_cpu_time, algorithm);
+        /*
+         * algorithm 기준에 따라 ready queue에서 실행할 process 선택
+         *
+         * HRRN은 ready_enter_time[]과 current_time을 사용하여
+         * response ratio를 계산한다.
+         */
+        process_index = select_process_from_ready(&run_config.ready_queue, processes, remaining_cpu_time, ready_enter_time, run_config.current_time, algorithm);
 
         if (process_index == -1) {
             break;
         }
 
+        /*
+         * CPU를 할당받은 process는 더 이상 ready queue에서 기다리는 상태가 아니므로
+         * ready_enter_time을 -1로 초기화한다.
+         */
+        ready_enter_time[process_index] = -1;
+
         run_start_time = run_config.current_time;
 
+        /*
+         * 선택된 process를 언제까지 실행할지 결정
+         *
+         * Non-preemptive: CPU burst 끝까지
+         * Preemptive   : 다음 event time 또는 CPU burst completion 중 빠른 시점까지
+         * RR / Lottery : time quantum 또는 CPU burst completion 중 빠른 시점까지
+         */
         run_end_time = get_run_end_time(&run_config, processes, io_completion_time, remaining_cpu_time, process_index, algorithm);
 
         executed_time = run_end_time - run_start_time;
 
+        /*
+         * 같은 시간에 event가 겹쳐 실행 시간이 0 이하가 되는 경우를 방지하는 안전 처리
+         * 다시 ready queue에 넣어야 하므로 ready_enter_time도 현재 시간으로 기록한다.
+         */
         if (executed_time <= 0) {
+            ready_enter_time[process_index] = run_config.current_time;
             enqueue(&run_config.ready_queue, process_index);
-            update_ready_queue_until(&run_config, processes, io_completion_time, run_config.current_time);
+
+            update_ready_queue_until(&run_config, processes, io_completion_time, ready_enter_time, run_config.current_time);
+
             continue;
         }
 
+        /*
+         * CPU 실행 구간을 Gantt chart에 기록
+         */
         add_gantt_segment(gantt, &gantt_count, process_index, run_start_time, run_end_time);
 
+        /*
+         * 실제 실행된 시간만큼 remaining CPU time 감소
+         */
         remaining_cpu_time[process_index] -= executed_time;
         run_config.current_time = run_end_time;
 
-        update_ready_queue_until(&run_config, processes, io_completion_time, run_config.current_time);
+        /*
+         * 실행 중 발생한 arrival / I/O completion event를 현재 시간까지 반영
+         */
+        update_ready_queue_until(&run_config, processes, io_completion_time, ready_enter_time, run_config.current_time);
 
+        /*
+         * 현재 CPU burst를 모두 실행한 경우
+         */
         if (remaining_cpu_time[process_index] == 0) {
             current_cpu_burst_index[process_index]++;
 
-            if (current_cpu_burst_index[process_index] < processes[process_index].cpu_burst_count) {
+            /*
+             * 아직 다음 CPU burst가 남아 있다면 I/O waiting queue로 이동
+             */
+            if (current_cpu_burst_index[process_index] <
+                processes[process_index].cpu_burst_count) {
                 int io_index = current_cpu_burst_index[process_index] - 1;
 
                 remaining_cpu_time[process_index] = processes[process_index].cpu_bursts[current_cpu_burst_index[process_index]];
@@ -1065,19 +1219,26 @@ static void run_scheduler(const Process processes[], const SchedulerConfig* base
 
                 enqueue(&run_config.waiting_queue, process_index);
             }
+            /*
+             * 모든 CPU burst가 끝난 경우 process 종료
+             */
             else {
                 completion_time[process_index] = run_config.current_time;
                 completed_count++;
             }
         }
+        /*
+         * CPU burst가 아직 남았는데 실행이 멈춘 경우
+         *
+         * 예:
+         *  - Preemptive SJF / Priority에서 event 발생
+         *  - Round Robin 또는 Lottery에서 time quantum 만료
+         *
+         * 이 process는 다시 ready queue에 들어가므로
+         * ready_enter_time을 현재 시간으로 기록한다.
+         */
         else {
-            /*
-             * CPU burst가 아직 끝나지 않았는데 실행이 멈춘 경우
-             *  - Preemptive algorithm: event 발생으로 재선택 필요
-             *  - RR: time quantum 만료
-             *
-             * 아직 실행할 CPU 시간이 남아 있는 process이므로 ready queue에 다시 삽입
-             */
+            ready_enter_time[process_index] = run_config.current_time;
             enqueue(&run_config.ready_queue, process_index);
         }
     }
@@ -1112,6 +1273,8 @@ static void print_algorithm_menu(void) {
     printf("5. Preemptive Priority\n");
     printf("6. Round Robin\n");
     printf("7. Lottery\n");
+    printf("8. Longest Job First\n");
+    printf("9. HRRN\n");
     printf("0. Exit\n");
 }
 
@@ -1121,7 +1284,7 @@ static void print_algorithm_menu(void) {
  * menu에서 사용자의 입력을 받아 scheduling algorithm 번호를 반환
  *
  * return 0: simulator 종료
- * return 1~7: 각 scheduling algorithm과 대응
+ * return 1~9: 각 scheduling algorithm과 대응
  */
 static int select_algorithm(void) {
     int choice;
@@ -1136,11 +1299,11 @@ static int select_algorithm(void) {
             continue;
         }
 
-        if (choice >= 0 && choice <= 7) {
+        if (choice >= 0 && choice <= 9) {
             return choice;
         }
 
-        printf("Invalid selection. Please choose agin.\n");
+        printf("Invalid selection. Please choose again.\n");
     }
 }
 
@@ -1223,12 +1386,18 @@ static void run_lottery(const Process processes[], const SchedulerConfig* base_c
     run_scheduler(processes, base_config, ALG_LOTTERY);
 }
 
+static void run_ljf(const Process processes[], const SchedulerConfig* base_config) {
+    run_scheduler(processes, base_config, ALG_LJF);
+}
+
+static void run_hrrn(const Process processes[], const SchedulerConfig* base_config) {
+    run_scheduler(processes, base_config, ALG_HRRN);
+}
+
 /*
  * schedule()
  * ------------------------------------------------------------
  * 사용자가 menu에서 입력한 번호에 맞는 scheduling 함수를 호출
- *
- * 실제 algorithm 구현은 run_fcfs(), run_round_robin() 등의 내부에 추가 예정
  */
 static void schedule(int selected_algorithm, const Process processes[], const SchedulerConfig* base_config) {
     switch (selected_algorithm) {
@@ -1253,6 +1422,13 @@ static void schedule(int selected_algorithm, const Process processes[], const Sc
     case 7:
         run_lottery(processes, base_config);
         break;
+    case 8:
+        run_ljf(processes, base_config);
+        break;
+    case 9:
+        run_hrrn(processes, base_config);
+        break;
+
     default:
         printf("Invalid algorithm selected.\n");
         break;
