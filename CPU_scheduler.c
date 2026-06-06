@@ -82,7 +82,8 @@
 #define ALG_ROUND_ROBIN 6
 #define ALG_LOTTERY 7
 #define ALG_LJF 8
-#define ALG_HRRN 9
+#define ALG_LRTF 9
+#define ALG_HRRN 10
 
 /*
  * Process 구조체
@@ -809,7 +810,7 @@ static int get_lottery_ticket_count(const Process* process) {
  *  SJF 계열       : remaining CPU time이 가장 짧은 process
  *  Priority 계열  : priority 값이 가장 작은 process
  *  Lottery        : priority에 따라 ticket을 부여하고 random ticket으로 선택
- *  LJF            : remaining CPU time이 가장 긴 process
+ *  LJF / LRTF     : remaining CPU time이 가장 긴 process
  *  HRRN           : response ratio가 가장 큰 process
  *
  * 선택된 process는 ready queue에서 제거되고, 나머지 process들의 순서는 유지된다.
@@ -915,7 +916,7 @@ static int select_process_from_ready(Queue* ready_queue, const Process processes
             int process_index = ready_queue->data[queue_position];
             int value;
 
-            if (algorithm == ALG_NON_PREEMPTIVE_SJF || algorithm == ALG_PREEMPTIVE_SJF || algorithm == ALG_LJF) {
+            if (algorithm == ALG_NON_PREEMPTIVE_SJF || algorithm == ALG_PREEMPTIVE_SJF || algorithm == ALG_LJF || algorithm == ALG_LRTF) {
                 value = remaining_cpu_time[process_index];
             }
             else {
@@ -923,9 +924,9 @@ static int select_process_from_ready(Queue* ready_queue, const Process processes
             }
 
             /*
-             * LJF는 값이 클수록 먼저 선택
+             * LJF / LRTF는 값이 클수록 먼저 선택
              */
-            if (algorithm == ALG_LJF) {
+            if (algorithm == ALG_LJF || algorithm == ALG_LRTF) {
                 if (selected_position == -1 || value > selected_value || (value == selected_value && process_index < selected_process)) {
                     selected_value = value;
                     selected_process = process_index;
@@ -986,6 +987,8 @@ static const char* get_algorithm_name(int algorithm) {
         return "Lottery";
     case ALG_LJF:
         return "Longest Job First";
+    case ALG_LRTF:
+        return "LRTF (Preemptive LJF)";
     case ALG_HRRN:
         return "HRRN";
     default:
@@ -999,7 +1002,8 @@ static const char* get_algorithm_name(int algorithm) {
  */
 static int is_preemptive_algorithm(int algorithm) {
     return algorithm == ALG_PREEMPTIVE_SJF ||
-        algorithm == ALG_PREEMPTIVE_PRIORITY;
+        algorithm == ALG_PREEMPTIVE_PRIORITY ||
+        algorithm == ALG_LRTF;
 }
 
 /* get_run_end_time()
@@ -1009,7 +1013,7 @@ static int is_preemptive_algorithm(int algorithm) {
  * Non-preemptive algorithm:
  *   현재 CPU burst가 끝날 때까지 실행
  *
- * Preemptive SJF / Preemptive Priority:
+ * Preemptive SJF / Preemptive Priority / LRTF:
  *   현재 CPU burst가 끝나기 전 arrival 또는 I/O completion event가 발생하면 그 event time까지만 실행하고 다시 process 선택
  *
  * Round Robin / Lottery:
@@ -1039,7 +1043,7 @@ static int get_run_end_time(const SchedulerConfig* scheduler_config, const Proce
 
 /* run_scheduler()
  * ------------------------------------------------------------
- * FCFS, SJF, Priority, RR, Lottery, LJF, HRRN algorithm을 실행시키는 공통 engine
+ * FCFS, SJF, Priority, RR, Lottery, LJF, LRTF, HRRN algorithm을 실행시키는 공통 engine
  *
  * HRRN을 위해 ready_enter_time[]을 추가로 관리한다.
  * ready_enter_time[i]는 Pi가 ready queue에 들어온 시간을 의미한다.
@@ -1231,7 +1235,7 @@ static void run_scheduler(const Process processes[], const SchedulerConfig* base
          * CPU burst가 아직 남았는데 실행이 멈춘 경우
          *
          * 예:
-         *  - Preemptive SJF / Priority에서 event 발생
+         *  - Preemptive SJF / Priority / LRTF에서 event 발생
          *  - Round Robin 또는 Lottery에서 time quantum 만료
          *
          * 이 process는 다시 ready queue에 들어가므로
@@ -1274,7 +1278,8 @@ static void print_algorithm_menu(void) {
     printf("6. Round Robin\n");
     printf("7. Lottery\n");
     printf("8. Longest Job First\n");
-    printf("9. HRRN\n");
+    printf("9. LRTF (Preemptive LJF)\n");
+    printf("10. HRRN\n");
     printf("0. Exit\n");
 }
 
@@ -1284,7 +1289,7 @@ static void print_algorithm_menu(void) {
  * menu에서 사용자의 입력을 받아 scheduling algorithm 번호를 반환
  *
  * return 0: simulator 종료
- * return 1~9: 각 scheduling algorithm과 대응
+ * return 1~10: 각 scheduling algorithm과 대응
  */
 static int select_algorithm(void) {
     int choice;
@@ -1299,7 +1304,7 @@ static int select_algorithm(void) {
             continue;
         }
 
-        if (choice >= 0 && choice <= 9) {
+        if (choice >= 0 && choice <= 10) {
             return choice;
         }
 
@@ -1390,6 +1395,10 @@ static void run_ljf(const Process processes[], const SchedulerConfig* base_confi
     run_scheduler(processes, base_config, ALG_LJF);
 }
 
+static void run_lrtf(const Process processes[], const SchedulerConfig* base_config) {
+    run_scheduler(processes, base_config, ALG_LRTF);
+}
+
 static void run_hrrn(const Process processes[], const SchedulerConfig* base_config) {
     run_scheduler(processes, base_config, ALG_HRRN);
 }
@@ -1426,6 +1435,9 @@ static void schedule(int selected_algorithm, const Process processes[], const Sc
         run_ljf(processes, base_config);
         break;
     case 9:
+        run_lrtf(processes, base_config);
+        break;
+    case 10:
         run_hrrn(processes, base_config);
         break;
 
@@ -1445,12 +1457,7 @@ int main(void) {
     /* 사용자가 menu에서 선택한 scheduling algorithm 번호 */
     int selected_algorithm;
 
-    /*
-     * 난수 생성기의 seed
-     * 현재는 결과 확인과 디버깅을 용이하게 하기 위해 고정 seed 2026으로 설정
-     * 매번 다른 데이터 생성하기: srand((unsigned int)time(NULL));
-     */
-    srand(2026);
+    srand((unsigned int)time(NULL));
 
     create_processes(processes);
 
