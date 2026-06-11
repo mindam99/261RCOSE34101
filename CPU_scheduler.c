@@ -561,6 +561,41 @@ static int get_total_cpu_time(const Process* process) {
     return total;
 }
 
+/* get_total_remaining_cpu_time()
+ * ------------------------------------------------------------
+ * 현재 시점에서 process가 앞으로 더 사용해야 하는 전체 CPU time을 계산
+ *
+ * 포함하는 값:
+ *  1. 현재 CPU burst에서 아직 남은 시간
+ *  2. 이후에 수행할 CPU burst time들의 합
+ *
+ * 포함하지 않는 값:
+ *  - I/O burst time
+ *
+ * 이유:
+ *  SJF/LJF/LRTF 계열에서 process의 전체 남은 CPU 작업량을 기준으로
+ *  scheduling하기 위해 사용한다.
+ */
+static int get_total_remaining_cpu_time(const Process processes[], const int current_cpu_burst_index[], const int remaining_cpu_time[], int process_index) {
+    int i;
+    int total = 0;
+    int cpu_index = current_cpu_burst_index[process_index];
+
+    if (cpu_index >= processes[process_index].cpu_burst_count) {
+        return 0;
+    }
+
+    /* 현재 CPU burst에서 아직 남은 시간을 더한다. */
+    total += remaining_cpu_time[process_index];
+
+    /* 이후에 남아 있는 future CPU burst time들을 더한다. */
+    for (i = cpu_index + 1; i < processes[process_index].cpu_burst_count; i++) {
+        total += processes[process_index].cpu_bursts[i];
+    }
+
+    return total;
+}
+
 /* get_total_io_time()
  * ------------------------------------------------------------
  * evaluation에서 waiting time을 계산하기 위해 한 process의 전체 I/O burst time 합을 반환
@@ -807,15 +842,15 @@ static int get_lottery_ticket_count(const Process* process) {
  *
  * algorithm별 선택 기준:
  *  FCFS / RR      : ready queue의 첫 process
- *  SJF 계열       : remaining CPU time이 가장 짧은 process
+ *  SJF 계열       : 전체 남은 CPU burst time이 가장 짧은 process
  *  Priority 계열  : priority 값이 가장 작은 process
  *  Lottery        : priority에 따라 ticket을 부여하고 random ticket으로 선택
- *  LJF / LRTF     : remaining CPU time이 가장 긴 process
+ *  LJF / LRTF     : 전체 남은 CPU burst time이 가장 긴 process
  *  HRRN           : response ratio가 가장 큰 process
  *
  * 선택된 process는 ready queue에서 제거되고, 나머지 process들의 순서는 유지된다.
  */
-static int select_process_from_ready(Queue* ready_queue, const Process processes[], const int remaining_cpu_time[], const int ready_enter_time[], int current_time, int algorithm) {
+static int select_process_from_ready(Queue* ready_queue, const Process processes[], const int current_cpu_burst_index[], const int remaining_cpu_time[], const int ready_enter_time[], int current_time, int algorithm) {
     Queue temp;
     int i;
     int selected_position = -1;
@@ -872,10 +907,10 @@ static int select_process_from_ready(Queue* ready_queue, const Process processes
      * ------------------------------------------------------------
      * response ratio가 가장 큰 process를 선택한다.
      *
-     * response ratio = (waiting time + CPU burst time) / CPU burst time
+     * 여기서 CPU time은 현재 CPU burst 하나가 아니라
+     * 앞으로 남은 전체 CPU burst time의 합을 사용한다.
      *
-     * waiting time은 ready queue에 들어온 시점부터
-     * 현재 scheduling 시점까지의 시간이다.
+     * response ratio = (waiting time + total remaining CPU time) / total remaining CPU time
      */
     else if (algorithm == ALG_HRRN) {
         double selected_response_ratio = -1.0;
@@ -883,9 +918,11 @@ static int select_process_from_ready(Queue* ready_queue, const Process processes
         for (i = 0; i < original_count; i++) {
             int queue_position = (ready_queue->front + i) % PROCESS_COUNT;
             int process_index = ready_queue->data[queue_position];
-            int cpu_time = remaining_cpu_time[process_index];
+            int cpu_time;
             int waiting_time;
             double response_ratio;
+
+            cpu_time = get_total_remaining_cpu_time(processes, current_cpu_burst_index, remaining_cpu_time, process_index);
 
             if (ready_enter_time[process_index] == -1) {
                 waiting_time = 0;
@@ -894,7 +931,12 @@ static int select_process_from_ready(Queue* ready_queue, const Process processes
                 waiting_time = current_time - ready_enter_time[process_index];
             }
 
-            response_ratio = (double)(waiting_time + cpu_time) / cpu_time;
+            if (cpu_time <= 0) {
+                response_ratio = 0.0;
+            }
+            else {
+                response_ratio = (double)(waiting_time + cpu_time) / cpu_time;
+            }
 
             if (selected_position == -1 || response_ratio > selected_response_ratio || (response_ratio == selected_response_ratio && process_index < selected_process)) {
                 selected_response_ratio = response_ratio;
@@ -907,8 +949,8 @@ static int select_process_from_ready(Queue* ready_queue, const Process processes
         /*
          * SJF / LJF / Priority Scheduling
          * ------------------------------------------------------------
-         * SJF      : remaining CPU time이 가장 짧은 process 선택
-         * LJF      : remaining CPU time이 가장 긴 process 선택
+         * SJF      : 전체 남은 CPU burst time이 가장 짧은 process 선택
+         * LJF      : 전체 남은 CPU burst time이 가장 긴 process 선택
          * Priority : priority 값이 가장 작은 process 선택
          */
         for (i = 0; i < original_count; i++) {
@@ -917,7 +959,7 @@ static int select_process_from_ready(Queue* ready_queue, const Process processes
             int value;
 
             if (algorithm == ALG_NON_PREEMPTIVE_SJF || algorithm == ALG_PREEMPTIVE_SJF || algorithm == ALG_LJF || algorithm == ALG_LRTF) {
-                value = remaining_cpu_time[process_index];
+                value = get_total_remaining_cpu_time(processes, current_cpu_burst_index, remaining_cpu_time, process_index);
             }
             else {
                 value = processes[process_index].priority;
@@ -1150,7 +1192,7 @@ static void run_scheduler(const Process processes[], const SchedulerConfig* base
          * HRRN은 ready_enter_time[]과 current_time을 사용하여
          * response ratio를 계산한다.
          */
-        process_index = select_process_from_ready(&run_config.ready_queue, processes, remaining_cpu_time, ready_enter_time, run_config.current_time, algorithm);
+        process_index = select_process_from_ready(&run_config.ready_queue, processes, current_cpu_burst_index, remaining_cpu_time, ready_enter_time, run_config.current_time, algorithm);
 
         if (process_index == -1) {
             break;
